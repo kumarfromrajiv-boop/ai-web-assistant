@@ -1,0 +1,326 @@
+import os
+import json
+import socket
+import ipaddress
+from urllib.parse import urlparse
+
+from flask import Flask, request, jsonify, render_template_string
+from openai import OpenAI
+from playwright.sync_api import sync_playwright
+
+app = Flask(__name__)
+
+# API key को environment variable में रखें।
+API_KEY = os.getenv("MODEL_API_KEY", "")
+META_MODEL = os.getenv("META_MODEL", "muse-spark-1.3")
+
+client = (
+    OpenAI(
+        base_url="https://api.meta.ai/v1",
+        api_key=API_KEY
+    )
+    if API_KEY else None
+)
+
+PAGE = """
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Website Assistant</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f3f6fb;color:#172033;
+font-family:Arial,sans-serif}
+header{background:#172b4d;color:white;padding:22px;text-align:center}
+main{max-width:760px;margin:25px auto;padding:16px}
+.card{background:white;border-radius:14px;padding:20px;
+margin-bottom:18px;box-shadow:0 3px 15px #0000000d}
+label{display:block;font-weight:bold;margin:14px 0 7px}
+input,textarea{width:100%;padding:12px;border:1px solid #ccd4e0;
+border-radius:8px;font-size:16px}
+textarea{min-height:100px;resize:vertical}
+button{border:0;border-radius:8px;padding:12px 16px;
+background:#2463eb;color:white;font-size:15px;margin-top:12px;
+cursor:pointer}
+button:disabled{opacity:.5}
+.secondary{background:#42526b}
+.result{white-space:pre-wrap;overflow-wrap:anywhere;
+background:#f5f7fb;border-radius:8px;padding:12px;margin-top:12px}
+small{color:#586579}
+</style>
+</head>
+<body>
+<header>
+<h2>AI Website Assistant</h2>
+<p>अपना काम बताइए — AI आपकी मदद करेगा</p>
+</header>
+<main>
+<section class="card">
+<h3>आप क्या काम करवाना चाहते हैं?</h3>
+<label>काम का विवरण</label>
+<textarea id="task" placeholder="उदाहरण: इस वेबसाइट पर मेरा फॉर्म भरने में मदद करो।"></textarea>
+<button onclick="askAI()">Meta AI से पूछें</button>
+<div id="answer" class="result">आपका जवाब यहाँ दिखाई देगा।</div>
+</section>
+
+<section class="card">
+<h3>वेबसाइट पर फॉर्म भरने में सहायता</h3>
+<small>केवल उस वेबसाइट का उपयोग करें जहाँ आपको काम करने की अनुमति है।</small>
+<label>वेबसाइट का लिंक</label>
+<input id="url" type="url" placeholder="https://example.com/contact">
+<button onclick="inspectSite()">वेबसाइट के फ़ील्ड देखें</button>
+<div id="fields"></div>
+<div id="status" class="result">अभी कोई वेबसाइट जाँची नहीं गई है।</div>
+</section>
+</main>
+<script>
+async function askAI(){
+ const task=document.getElementById('task').value.trim();
+ if(!task){alert('पहले अपना काम लिखें।');return}
+ const out=document.getElementById('answer');
+ out.textContent='AI जवाब तैयार कर रहा है...';
+ try{
+  const r=await fetch('/ask',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({task})});
+  const d=await r.json();
+  out.textContent=d.answer||d.error;
+ }catch(e){out.textContent='कनेक्शन में समस्या: '+e}
+}
+async function inspectSite(){
+ const url=document.getElementById('url').value.trim();
+ const status=document.getElementById('status');
+ const box=document.getElementById('fields');
+ status.textContent='वेबसाइट जाँची जा रही है...';
+ box.innerHTML='';
+ try{
+  const r=await fetch('/inspect',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({url})});
+  const d=await r.json();
+  if(!r.ok){status.textContent=d.error;return}
+  status.textContent=d.message;
+  d.fields.forEach((f,i)=>{
+   if(f.type==='hidden'||f.type==='submit'||f.type==='password')return;
+   const wrap=document.createElement('div');
+   const label=document.createElement('label');
+   label.textContent=f.label||f.name||('फ़ील्ड '+(i+1));
+   const input=document.createElement('input');
+   input.value=f.value||'';
+   input.dataset.name=f.name||'';
+   input.dataset.index=String(i);
+   input.placeholder='यहाँ जानकारी लिखें';
+   wrap.append(label,input);
+   box.append(wrap);
+  });
+  if(d.fields.length){
+   const btn=document.createElement('button');
+   btn.textContent='जानकारी भरें (सबमिट नहीं होगा)';
+   btn.onclick=fillFields;
+   box.append(btn);
+  }
+ }catch(e){status.textContent='त्रुटि: '+e}
+}
+async function fillFields(){
+ const values=[...document.querySelectorAll('#fields input')].map(i=>({
+  name:i.dataset.name,index:Number(i.dataset.index),value:i.value
+ }));
+ const status=document.getElementById('status');
+ status.textContent='फ़ील्ड भरने की कोशिश हो रही है...';
+ try{
+  const r=await fetch('/fill',{method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    url:document.getElementById('url').value.trim(),values
+   })});
+  const d=await r.json();
+  status.textContent=d.message||d.error;
+ }catch(e){status.textContent='त्रुटि: '+e}
+}
+</script>
+</body>
+</html>
+"""
+
+
+def validate_url(url):
+    """केवल सार्वजनिक HTTP/HTTPS वेबसाइटों को अनुमति दें।"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False, "सही HTTP/HTTPS वेबसाइट लिंक दें।"
+
+        host = parsed.hostname.lower()
+        if host == "localhost" or host.endswith(".localhost"):
+            return False, "लोकल वेबसाइट की अनुमति नहीं है।"
+
+        addresses = socket.getaddrinfo(host, None)
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if not ip.is_global:
+                return False, "यह लोकल या निजी नेटवर्क का पता है।"
+
+        return True, ""
+    except Exception:
+        return False, "वेबसाइट का पता जाँचा नहीं जा सका।"
+
+
+@app.route("/")
+def home():
+    return render_template_string(PAGE)
+
+
+@app.post("/ask")
+def ask():
+    data = request.get_json(silent=True) or {}
+    task = str(data.get("task", "")).strip()
+
+    if not task:
+        return jsonify(error="कृपया अपना काम लिखें।"), 400
+    if len(task) > 4000:
+        return jsonify(error="काम का विवरण बहुत लंबा है।"), 400
+    if not client:
+        return jsonify(
+            error="Meta API चालू नहीं है। MODEL_API_KEY सेट करें।"
+        ), 503
+
+    try:
+        response = client.chat.completions.create(
+            model=META_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "आप हिंदी में मदद करने वाले वेबसाइट सहायक हैं। "
+                        "स्पष्ट करें कि आप क्या कर सकते हैं और कौन-सी "
+                        "जानकारी चाहिए।"
+                    )
+                },
+                {"role": "user", "content": task}
+            ]
+        )
+        answer = response.choices[0].message.content
+        return jsonify(answer=answer or "AI से कोई जवाब नहीं मिला।")
+    except Exception:
+        app.logger.exception("Meta API error")
+        return jsonify(error="Meta AI से संपर्क नहीं हो पाया।"), 502
+
+
+@app.post("/inspect")
+def inspect():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+    valid, error = validate_url(url)
+
+    if not valid:
+        return jsonify(error=error), 400
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+            fields = page.locator(
+                "input:not([type=hidden]), textarea, select"
+            )
+            results = []
+
+            for i in range(min(fields.count(), 60)):
+                item = fields.nth(i)
+                try:
+                    typ = (item.get_attribute("type") or "text").lower()
+                    if typ in ("password", "submit", "hidden", "file"):
+                        continue
+
+                    name = item.get_attribute("name") or ""
+                    label = (
+                        item.get_attribute("aria-label")
+                        or item.get_attribute("placeholder")
+                        or name
+                    )
+                    value = ""
+                    if typ not in ("checkbox", "radio"):
+                        value = item.input_value(timeout=1000)
+
+                    results.append({
+                        "name": name,
+                        "type": typ,
+                        "label": label,
+                        "value": value
+                    })
+                except Exception:
+                    continue
+
+            browser.close()
+
+        return jsonify(
+            message=f"वेबसाइट खुल गई। {len(results)} फ़ील्ड मिले।",
+            fields=results
+        )
+    except Exception:
+        app.logger.exception("Browser inspection failed")
+        return jsonify(error="वेबसाइट नहीं खुली या फ़ील्ड पढ़े नहीं जा सके।"), 502
+
+
+@app.post("/fill")
+def fill():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+    values = data.get("values", [])
+
+    valid, error = validate_url(url)
+    if not valid:
+        return jsonify(error=error), 400
+    if not isinstance(values, list) or len(values) > 60:
+        return jsonify(error="फ़ील्ड की सूची सही नहीं है।"), 400
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+            filled = 0
+            failed = 0
+
+            for item in values:
+                try:
+                    index = int(item.get("index", -1))
+                    value = str(item.get("value", ""))
+
+                    if index < 0 or len(value) > 2000:
+                        failed += 1
+                        continue
+
+                    locator = page.locator(
+                        "input:not([type=hidden]):not([type=password]):"
+                        "not([type=submit]):not([type=file]), textarea, select"
+                    ).nth(index)
+
+                    typ = (locator.get_attribute("type") or "text").lower()
+                    if typ in ("checkbox", "radio"):
+                        failed += 1
+                        continue
+
+                    locator.fill(value, timeout=2000)
+                    filled += 1
+                except Exception:
+                    failed += 1
+
+            browser.close()
+
+        return jsonify(
+            message=f"{filled} फ़ील्ड भरने की कोशिश सफल रही; {failed} फ़ील्ड नहीं भरे जा सके।"
+        )
+    except Exception:
+        app.logger.exception("Browser fill failed")
+        return jsonify(error="फॉर्म के फ़ील्ड भरते समय समस्या आई।"), 502
+
+
+if __name__ == "__main__":
+    # क्लाउड सर्वर (जैसे Replit/Render) के लिए पोर्ट और होस्ट सेटिंग्स
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
